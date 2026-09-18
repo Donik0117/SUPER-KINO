@@ -115,22 +115,39 @@ def subscription_kb(channels):
     buttons.append([InlineKeyboardButton(text="✅ A'zo bo'ldim / Tekshirish", callback_data="check_subscription")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-# --- Obuna tekshirish ---
+# Kanal ID yoki Username ni to'g'rilash funksiyasi
+def normalize_chat_id(ch_str: str):
+    ch_str = str(ch_str).strip()
+    if "t.me/" in ch_str:
+        clean = ch_str.split("t.me/")[-1].replace("+", "").replace("/", "").strip()
+        ch_str = "@" + clean
+    elif not ch_str.startswith("-100") and not ch_str.startswith("@") and not ch_str.lstrip("-").isdigit():
+        ch_str = "@" + ch_str
+
+    if ch_str.lstrip("-").isdigit():
+        return int(ch_str)
+    return ch_str
+
+# --- Obuna tekshirish (Mukammal versiya) ---
 async def is_subscribed(user_id: int):
     channels = await db.get_channels()
     if not channels:
         return True, []
+    
     unsub = []
     for ch in channels:
+        ch_target = normalize_chat_id(ch[1])
         try:
-            m = await bot.get_chat_member(chat_id=ch[1], user_id=user_id)
+            m = await bot.get_chat_member(chat_id=ch_target, user_id=user_id)
             if m.status in ["left", "kicked"]:
                 unsub.append(ch)
-        except Exception:
-            pass
+        except Exception as err:
+            print(f"[OBUNA TEKSHIRISH XATOSI] Kanal: {ch_target}, Xato: {err}")
+            # Agar bot kanalga admin bo'lmasa yoki kanal xato kiritilgan bo'lsa:
+            unsub.append(ch)
+            
     return len(unsub) == 0, unsub
 
-# Avtomatik zaxiralash funksiyasi
 async def send_auto_backup(extra_info=""):
     try:
         if os.path.exists("kino_master.db") and ADMIN_ID:
@@ -190,7 +207,7 @@ async def category_handler(message: types.Message):
     passed, _ = await is_subscribed(message.from_user.id)
     if not passed:
         chs = await db.get_channels()
-        await message.answer("⚠️ Avval kanallarga a'zo bo'ling:", reply_markup=subscription_kb(chs))
+        await message.answer("⚠️ <b>Kino ko'rish uchun avval kanallarga a'zo bo'ling:</b>", reply_markup=subscription_kb(chs), parse_mode="HTML")
         return
 
     cat_name = message.text.split(" ")[-1]
@@ -219,6 +236,12 @@ async def noop_cb(call: types.CallbackQuery):
 # --- QIDIRUV ---
 @dp.message(F.text == "🔍 Qidirish")
 async def search_cmd(message: types.Message, state: FSMContext):
+    passed, _ = await is_subscribed(message.from_user.id)
+    if not passed:
+        chs = await db.get_channels()
+        await message.answer("⚠️ <b>Avval kanallarga a'zo bo'ling:</b>", reply_markup=subscription_kb(chs), parse_mode="HTML")
+        return
+
     await message.answer("🔎 Qidirmoqchi bo'lgan kino, anime yoki serial <b>nomini</b> yoki <b>kodini</b> yozing:", parse_mode="HTML")
     await state.set_state(SearchState.query)
 
@@ -245,6 +268,12 @@ async def process_search_query(message: types.Message, state: FSMContext):
 # --- TOP 10 ---
 @dp.message(F.text == "🔝 Top 10")
 async def top_movies_handler(message: types.Message):
+    passed, _ = await is_subscribed(message.from_user.id)
+    if not passed:
+        chs = await db.get_channels()
+        await message.answer("⚠️ <b>Avval kanallarga a'zo bo'ling:</b>", reply_markup=subscription_kb(chs), parse_mode="HTML")
+        return
+
     tops = await db.get_top_movies(10)
     if not tops:
         await message.answer("Bazada hali kontent yo'q.")
@@ -262,6 +291,12 @@ async def top_movies_handler(message: types.Message):
 # --- TASODIFIY ---
 @dp.message(F.text == "🎲 Tasodifiy")
 async def random_movie_handler(message: types.Message):
+    passed, _ = await is_subscribed(message.from_user.id)
+    if not passed:
+        chs = await db.get_channels()
+        await message.answer("⚠️ <b>Avval kanallarga a'zo bo'ling:</b>", reply_markup=subscription_kb(chs), parse_mode="HTML")
+        return
+
     movie = await db.get_random_movie()
     if movie:
         file_id, caption, code, title, category = movie
@@ -286,7 +321,6 @@ async def admin_cmd(message: types.Message):
         return
     await message.answer("👑 <b>Admin Boshqaruv Markazi:</b>", reply_markup=admin_menu(), parse_mode="HTML")
 
-# Baza zaxira nusxasi yuklab olish (/backup)
 @dp.message(Command("backup"))
 @dp.callback_query(F.data == "adm_backup")
 async def adm_backup_cb(event: types.Message | types.CallbackQuery):
@@ -301,7 +335,6 @@ async def adm_backup_cb(event: types.Message | types.CallbackQuery):
     if isinstance(event, types.CallbackQuery):
         await event.answer()
 
-# Baza tiklash (Admin .db fayl yuborsa, uni qabul qilib bazani tiklaydi)
 @dp.message(F.document, F.chat.id == ADMIN_ID)
 async def restore_database(message: types.Message):
     if message.document.file_name and message.document.file_name.endswith(".db"):
@@ -377,8 +410,6 @@ async def add_c_video(message: types.Message, state: FSMContext):
         parse_mode="HTML"
     )
     await state.clear()
-    
-    # Har bir yangi kino qo'shilganda zaxira nusxasini avtomatik yuborish
     await send_auto_backup(f"Yangi qo'shildi: {data['title']} ({data['code']})")
 
 # Kontent o'chirish
@@ -394,48 +425,68 @@ async def del_c_finish(message: types.Message, state: FSMContext):
     await message.answer("✅ Muvaffaqiyatli o'chirildi.")
     await state.clear()
 
-# Kanallar
+# Kanallar (Aqlli tekshiruv bilan)
 @dp.callback_query(F.data == "adm_channels")
 async def ch_list_cb(call: types.CallbackQuery):
     chs = await db.get_channels()
-    kb = [[InlineKeyboardButton(text=f"❌ O'chirish: {c[2]}", callback_data=f"delch_{c[0]}")] for c in chs]
+    kb = []
+    for c in chs:
+        kb.append([InlineKeyboardButton(text=f"❌ O'chirish: {c[2]} ({c[1]})", callback_data=f"delch_{c[0]}")])
     kb.append([InlineKeyboardButton(text="➕ Yangi kanal qo'shish", callback_data="add_ch")])
-    await call.message.answer("📢 <b>Homiy kanallar ro'yxati:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
+    await call.message.answer("📢 <b>Majburiy a'zolik kanallari:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
     await call.answer()
 
 @dp.callback_query(F.data.startswith("delch_"))
 async def del_ch_cb(call: types.CallbackQuery):
     cid = int(call.data.replace("delch_", ""))
     await db.delete_channel(cid)
-    await call.message.answer("✅ Kanal o'chirildi.")
+    await call.message.answer("✅ Kanal ro'yxatdan o'chirildi.")
     await call.answer()
 
 @dp.callback_query(F.data == "add_ch")
 async def add_ch_start(call: types.CallbackQuery, state: FSMContext):
-    await call.message.answer("Kanal <b>ID</b> yoki <b>@username</b>ini yuboring:", parse_mode="HTML")
+    await call.message.answer(
+        "Kanal <b>@username</b>ini (masalan: <code>@mening_kanalim</code>) yoki <b>ID</b>sini (masalan: <code>-1001234567890</code>) yuboring:\n\n"
+        "⚠️ <i>Muhim: Bot o'sha kanalda <b>Admin</b> bo'lishi shart!</i>",
+        parse_mode="HTML"
+    )
     await state.set_state(AddChannelState.channel_id)
     await call.answer()
 
 @dp.message(AddChannelState.channel_id)
 async def add_ch_id(message: types.Message, state: FSMContext):
-    await state.update_data(channel_id=message.text.strip())
-    await message.answer("Kanal uchun nom yozing:")
+    raw_val = message.text.strip()
+    target_id = normalize_chat_id(raw_val)
+    
+    # Bot haqiqatan ham shu kanalda adminligini tekshirib ko'ramiz
+    try:
+        me = await bot.get_me()
+        chat_member = await bot.get_chat_member(chat_id=target_id, user_id=me.id)
+        if chat_member.status not in ["administrator", "creator"]:
+            await message.answer("❌ <b>Xatolik:</b> Bot ushbu kanalda <b>Admin emas</b>! Avval botni kanalga admin qilib, so'ng qayta yuboring.", parse_mode="HTML")
+            return
+    except Exception as e:
+        await message.answer(f"⚠️ <b>Kanal topilmadi yoki bot kanalga admin qilinmagan!</b>\nXatolik: <code>{e}</code>\n\nIltimos, avval botni kanalingizga admin qiling va qayta yuboring.", parse_mode="HTML")
+        return
+
+    await state.update_data(channel_id=str(target_id))
+    await message.answer("✅ Bot kanalda admin ekanligi tasdiqlandi!\n\nEndi tugmada ko'rinadigan <b>nom</b> yozing (Masalan: <i>Rasmiy Kanalimiz</i>):", parse_mode="HTML")
     await state.set_state(AddChannelState.title)
 
 @dp.message(AddChannelState.title)
 async def add_ch_title(message: types.Message, state: FSMContext):
     await state.update_data(title=message.text.strip())
-    await message.answer("Kanalga havola (link) yuboring:")
+    await message.answer("Endi kanalga a'zo bo'lish <b>havolasini (link)</b> yuboring (Masalan: <code>https://t.me/mening_kanalim</code>):", parse_mode="HTML")
     await state.set_state(AddChannelState.url)
 
 @dp.message(AddChannelState.url)
 async def add_ch_finish(message: types.Message, state: FSMContext):
     data = await state.get_data()
     await db.add_channel(data['channel_id'], data['title'], message.text.strip())
-    await message.answer("✅ Kanal muvaffaqiyatli qo'shildi! Botni o'sha kanalga admin qilishni unutmang.")
+    await message.answer("🎉 <b>Kanal muvaffaqiyatli qo'shildi va faollashtirildi!</b>\nEndi barcha foydalanuvchilar ushbu kanalga a'zo bo'lishga majbur bo'ladilar.", parse_mode="HTML")
     await state.clear()
 
-# Rassilka (Telegram cheklovlaridan himoyalangan)
+# Rassilka
 @dp.callback_query(F.data == "adm_broadcast")
 async def broad_start(call: types.CallbackQuery, state: FSMContext):
     await call.message.answer("📢 Tarqatmoqchi bo'lgan xabaringizni yuboring:")
@@ -467,6 +518,13 @@ async def broad_finish(message: types.Message, state: FSMContext):
 # Inline orqali kino olish
 @dp.callback_query(F.data.startswith("get_"))
 async def get_inline_movie(call: types.CallbackQuery):
+    passed, _ = await is_subscribed(call.from_user.id)
+    if not passed:
+        chs = await db.get_channels()
+        await call.message.answer("⚠️ <b>Avval kanallarga a'zo bo'ling:</b>", reply_markup=subscription_kb(chs), parse_mode="HTML")
+        await call.answer()
+        return
+
     code = call.data.replace("get_", "")
     movie = await db.get_movie_by_code(code)
     if movie:
@@ -480,7 +538,7 @@ async def handle_direct_code(message: types.Message):
     passed, _ = await is_subscribed(message.from_user.id)
     if not passed:
         chs = await db.get_channels()
-        await message.answer("⚠️ Avval kanallarga a'zo bo'ling:", reply_markup=subscription_kb(chs))
+        await message.answer("⚠️ <b>Avval kanallarga a'zo bo'ling:</b>", reply_markup=subscription_kb(chs), parse_mode="HTML")
         return
 
     text = message.text.strip()
@@ -507,7 +565,6 @@ async def start_web_server():
     print(f"Web server {port}-portda ishga tushdi.")
 
 async def self_ping_task():
-    """Render bepul tarifda uxlab qolmasligi uchun har 9 daqiqada o'z-o'ziga ping yuboradi"""
     await asyncio.sleep(60)
     url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("PING_URL")
     if not url:
@@ -523,7 +580,6 @@ async def self_ping_task():
         await asyncio.sleep(540)
 
 async def daily_backup_task():
-    """Har 24 soatda adminga bazani yuborib turadi"""
     while True:
         await asyncio.sleep(86400)
         await send_auto_backup("📅 Kunlik rejaviy zaxira")
