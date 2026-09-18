@@ -12,6 +12,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton, FSInputFile
 )
 from aiogram.exceptions import TelegramRetryAfter
+import aiosqlite
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 try:
@@ -59,12 +60,44 @@ class AddAdminState(StatesGroup):
     user_id = State()
     name = State()
 
-# --- Adminlikni tekshirish ---
+# --- Kafolatlangan Admin Baza Funksiyalari (database.py ga bog'liq bo'lmagan holda ishlaydi) ---
+async def ensure_admins_table():
+    async with aiosqlite.connect("kino_master.db") as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id INTEGER PRIMARY KEY,
+                name TEXT,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await conn.commit()
+
+async def get_all_admins_safe():
+    await ensure_admins_table()
+    async with aiosqlite.connect("kino_master.db") as conn:
+        async with conn.execute("SELECT user_id, name FROM admins") as cur:
+            return await cur.fetchall()
+
+async def add_admin_safe(user_id: int, name: str = ""):
+    await ensure_admins_table()
+    async with aiosqlite.connect("kino_master.db") as conn:
+        await conn.execute("INSERT OR REPLACE INTO admins (user_id, name) VALUES (?, ?)", (user_id, name))
+        await conn.commit()
+
+async def remove_admin_safe(user_id: int):
+    await ensure_admins_table()
+    async with aiosqlite.connect("kino_master.db") as conn:
+        await conn.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
+        await conn.commit()
+
 async def check_is_admin(user_id: int) -> bool:
     if user_id == OWNER_ID:
         return True
-    admin_ids = await db.get_admin_ids()
-    return user_id in admin_ids
+    await ensure_admins_table()
+    async with aiosqlite.connect("kino_master.db") as conn:
+        async with conn.execute("SELECT user_id FROM admins WHERE user_id = ?", (user_id,)) as cur:
+            row = await cur.fetchone()
+            return row is not None
 
 # --- Klaviaturalar ---
 def main_menu():
@@ -336,34 +369,38 @@ async def admin_cmd(message: types.Message):
     is_owner = (message.from_user.id == OWNER_ID)
     await message.answer("👑 <b>Admin Boshqaruv Markazi:</b>", reply_markup=admin_menu(is_owner=is_owner), parse_mode="HTML")
 
-# --- ADMINLARNI BOSHQARISH (FAQAT BOSH ADMIN UCHUN) ---
+# --- ADMINLARNI BOSHQARISH (100% KAFOLATLANGAN) ---
 @dp.callback_query(F.data == "adm_manage_admins")
 async def manage_admins_cb(call: types.CallbackQuery):
-    if call.from_user.id != OWNER_ID:
-        await call.answer("Bu bo'lim faqat Bosh Admin uchun!", show_alert=True)
-        return
-    
-    admins = await db.get_all_admins()
-    buttons = []
-    for uid, name in admins:
-        display_name = name or f"Admin {uid}"
-        buttons.append([InlineKeyboardButton(text=f"❌ Chetlashtirish: {display_name}", callback_data=f"deladmin_{uid}")])
-    
-    buttons.append([InlineKeyboardButton(text="➕ Yangi Admin tayinlash", callback_data="add_admin_start")])
-    buttons.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="adm_back_to_menu")])
+    try:
+        if call.from_user.id != OWNER_ID:
+            await call.answer("Bu bo'lim faqat Bosh Admin uchun!", show_alert=True)
+            return
+        
+        admins = await get_all_admins_safe()
+        buttons = []
+        for uid, name in admins:
+            display_name = name or f"Admin {uid}"
+            buttons.append([InlineKeyboardButton(text=f"❌ Chetlashtirish: {display_name}", callback_data=f"deladmin_{uid}")])
+        
+        buttons.append([InlineKeyboardButton(text="➕ Yangi Admin tayinlash", callback_data="add_admin_start")])
+        buttons.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="adm_back_to_menu")])
 
-    await call.message.answer(
-        "👥 <b>Yordamchi Adminlar Boshqaruvi:</b>\n\n"
-        "Siz istalgan paytda yordamchi admin qo'shishingiz yoki uning vakolatini bir zumda bekor qilishingiz (chetlashtirishingiz) mumkin.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-        parse_mode="HTML"
-    )
-    await call.answer()
+        await call.message.edit_text(
+            "👥 <b>Yordamchi Adminlar Boshqaruvi:</b>\n\n"
+            "Siz istalgan paytda yangi admin qo'shishingiz yoki uning vakolatini bir zumda bekor qilishingiz (chetlashtirishingiz) mumkin.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+            parse_mode="HTML"
+        )
+        await call.answer()
+    except Exception as e:
+        await call.message.answer(f"⚠️ Xatolik: {e}")
+        await call.answer()
 
 @dp.callback_query(F.data == "adm_back_to_menu")
 async def back_to_admin_menu(call: types.CallbackQuery):
     is_owner = (call.from_user.id == OWNER_ID)
-    await call.message.answer("👑 <b>Admin Boshqaruv Markazi:</b>", reply_markup=admin_menu(is_owner=is_owner), parse_mode="HTML")
+    await call.message.edit_text("👑 <b>Admin Boshqaruv Markazi:</b>", reply_markup=admin_menu(is_owner=is_owner), parse_mode="HTML")
     await call.answer()
 
 @dp.callback_query(F.data.startswith("deladmin_"))
@@ -373,16 +410,30 @@ async def del_admin_cb(call: types.CallbackQuery):
         return
     
     target_uid = int(call.data.replace("deladmin_", ""))
-    await db.remove_admin(target_uid)
-    await call.message.answer(f"✅ <b>Admin (ID: {target_uid}) muvaffaqiyatli chetlashtirildi!</b>\nEndi u botda adminlik qila olmaydi.", parse_mode="HTML")
-    await call.answer()
+    await remove_admin_safe(target_uid)
+    await call.answer("✅ Admin muvaffaqiyatli chetlashtirildi!", show_alert=True)
+    
+    # Ro'yxatni yangilash
+    admins = await get_all_admins_safe()
+    buttons = []
+    for uid, name in admins:
+        display_name = name or f"Admin {uid}"
+        buttons.append([InlineKeyboardButton(text=f"❌ Chetlashtirish: {display_name}", callback_data=f"deladmin_{uid}")])
+    buttons.append([InlineKeyboardButton(text="➕ Yangi Admin tayinlash", callback_data="add_admin_start")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="adm_back_to_menu")])
+    
+    await call.message.edit_text(
+        "👥 <b>Yordamchi Adminlar Boshqaruvi:</b>\n\nAdmin chetlashtirildi. Boshqa adminlar:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML"
+    )
 
 @dp.callback_query(F.data == "add_admin_start")
 async def add_admin_start_cb(call: types.CallbackQuery, state: FSMContext):
     if call.from_user.id != OWNER_ID:
         await call.answer("Ruxsat berilmagan!", show_alert=True)
         return
-    await call.message.answer("👤 Tayinlamoqchi bo'lgan shaxsning <b>Telegram ID raqamini</b> kiriting (masalan: <code>6902272738</code>):", parse_mode="HTML")
+    await call.message.answer("👤 Tayinlamoqchi bo'lgan shaxsning <b>Telegram ID raqamini</b> yuboring (masalan: <code>6902272738</code>):", parse_mode="HTML")
     await state.set_state(AddAdminState.user_id)
     await call.answer()
 
@@ -402,12 +453,12 @@ async def process_add_admin_name(message: types.Message, state: FSMContext):
     uid = data['user_id']
     name = message.text.strip()
     
-    await db.add_admin(user_id=uid, name=name)
+    await add_admin_safe(user_id=uid, name=name)
     await message.answer(
         f"🎉 <b>Yangi admin tayinlandi!</b>\n\n"
         f"👤 Nom: <b>{name}</b>\n"
         f"🆔 ID: <code>{uid}</code>\n\n"
-        f"Ushbu shaxs endi botga /admin deb yozib yangi kinolar qo'shishi mumkin. Kerak bo'lsa uni istalgan payt '👥 Adminlarni boshqarish' bo'limidan chetlashtira olasiz.",
+        f"Ushbu shaxs endi botga /admin deb yozib kinolar qo'shishi mumkin. Kerak bo'lsa uni istalgan payt '👥 Adminlarni boshqarish' bo'limidan chetlashtira olasiz.",
         parse_mode="HTML"
     )
     await state.clear()
@@ -693,6 +744,7 @@ async def daily_backup_task():
 
 async def main():
     await db.init_db()
+    await ensure_admins_table()
     if os.getenv("PORT"):
         asyncio.create_task(start_web_server())
         asyncio.create_task(self_ping_task())
