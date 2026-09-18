@@ -42,6 +42,10 @@ class AddContentState(StatesGroup):
     category = State()
     video = State()
 
+class BulkUploadState(StatesGroup):
+    category = State()
+    collecting = State()
+
 class SearchState(StatesGroup):
     query = State()
 
@@ -102,6 +106,17 @@ async def check_is_admin(user_id: int) -> bool:
             row = await cur.fetchone()
             return row is not None
 
+# Keyingi bo'sh kodni topish (Auto-increment)
+async def get_next_movie_code():
+    async with aiosqlite.connect("kino_master.db") as conn:
+        async with conn.execute("SELECT code FROM movies") as cur:
+            rows = await cur.fetchall()
+            numeric_codes = []
+            for r in rows:
+                if str(r[0]).isdigit():
+                    numeric_codes.append(int(r[0]))
+            return max(numeric_codes, default=100) + 1
+
 # --- Internetdan ma'lumot olish funksiyasi ---
 async def get_wikipedia_info(query: str):
     url = f"https://ru.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(query)}"
@@ -134,7 +149,8 @@ def main_menu():
 
 def admin_menu(is_owner: bool = False):
     buttons = [
-        [InlineKeyboardButton(text="➕ Yangi kontent qo'shish", callback_data="adm_add_content")],
+        [InlineKeyboardButton(text="➕ Yangi kino qo'shish (Yakka)", callback_data="adm_add_content")],
+        [InlineKeyboardButton(text="📦 Ommaviy ko'chirish (Avto-Import)", callback_data="adm_bulk_upload")],
         [InlineKeyboardButton(text="🗑 Kontentni o'chirish", callback_data="adm_del_content")],
         [InlineKeyboardButton(text="📊 Statistika", callback_data="adm_stats")]
     ]
@@ -145,12 +161,12 @@ def admin_menu(is_owner: bool = False):
         buttons.append([InlineKeyboardButton(text="💾 Baza yuklab olish", callback_data="adm_backup")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def category_choose_kb():
+def category_choose_kb(prefix="setcat_"):
     buttons = []
     row = []
     for cat in CATEGORIES:
         clean_cat = cat.split(" ")[-1]
-        row.append(InlineKeyboardButton(text=cat, callback_data=f"setcat_{clean_cat}"))
+        row.append(InlineKeyboardButton(text=cat, callback_data=f"{prefix}{clean_cat}"))
         if len(row) == 2:
             buttons.append(row)
             row = []
@@ -331,7 +347,6 @@ async def process_search_query(message: types.Message, state: FSMContext):
             buttons.append([InlineKeyboardButton(text=f"▶️ [{cat}] {title} ({code})", callback_data=f"get_{code}")])
         await message.answer(f"🔍 <b>'{query}'</b> bo'yicha bot bazasidan topilgan natijalar:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
     else:
-        # Agar bazada topilmasa, internetdan qidirishni taklif qilamiz
         encoded = urllib.parse.quote(query)
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🌐 Internetdan izlash", callback_data=f"webfind_{encoded}")]
@@ -373,7 +388,6 @@ async def web_find_cb(call: types.CallbackQuery):
 
 async def send_web_results(target_msg: types.Message, query: str):
     wait_msg = await target_msg.answer("🔎 <i>Internetdan qidirilmoqda, kuting...</i>", parse_mode="HTML")
-    
     encoded = urllib.parse.quote(query)
     title, desc, thumb = await get_wikipedia_info(query)
     
@@ -463,6 +477,90 @@ async def admin_cmd(message: types.Message):
         return
     is_owner = (message.from_user.id == OWNER_ID)
     await message.answer("👑 <b>Admin Boshqaruv Markazi:</b>", reply_markup=admin_menu(is_owner=is_owner), parse_mode="HTML")
+
+# --- OMMAVIY YUKLASH (BULK AUTO-IMPORT) ---
+@dp.callback_query(F.data == "adm_bulk_upload")
+async def bulk_upload_start(call: types.CallbackQuery, state: FSMContext):
+    if not await check_is_admin(call.from_user.id):
+        await call.answer("Ruxsat yo'q!", show_alert=True)
+        return
+    
+    await call.message.answer(
+        "📦 <b>Ommaviy Ko'chirish (Avto-Import):</b>\n\n"
+        "Ko'chirmoqchi bo'lgan kinolaringiz qaysi <b>bo'limga</b> tushsin?",
+        reply_markup=category_choose_kb(prefix="bulkcat_"),
+        parse_mode="HTML"
+    )
+    await state.set_state(BulkUploadState.category)
+    await call.answer()
+
+@dp.callback_query(BulkUploadState.category, F.data.startswith("bulkcat_"))
+async def bulk_cat_selected(call: types.CallbackQuery, state: FSMContext):
+    cat_val = call.data.replace("bulkcat_", "")
+    await state.update_data(category=cat_val, count=0)
+    
+    next_c = await get_next_movie_code()
+    text = (
+        f"✅ <b>Bo'lim tanlandi: {cat_val}</b>\n\n"
+        f"🚀 <b>Avto-Import rejimi YOQILDI!</b>\n\n"
+        f"📌 <b>Endi nima qilasiz:</b>\n"
+        f"1. Istalgan kino kanaliga kiring;\n"
+        f"2. 10 ta, 50 ta yoki 100 ta kinoni tanlang (belgilang);\n"
+        f"3. Botga <b>Forward (Uzatish)</b> qilib tashlang!\n\n"
+        f"Bot har bir videoni avtomatik tarzda <code>{next_c}</code> dan boshlab raqamlab, nomini olib bazaga saqlab ketadi!\n\n"
+        f"Tugatgach, shunchaki <b>/done</b> deb yozing."
+    )
+    await call.message.answer(text, parse_mode="HTML")
+    await state.set_state(BulkUploadState.collecting)
+    await call.answer()
+
+@dp.message(BulkUploadState.collecting, F.video)
+async def bulk_collect_video(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    cat = data.get("category", "Kinolar")
+    count = data.get("count", 0) + 1
+    
+    code = await get_next_movie_code()
+    file_id = message.video.file_id
+    
+    # Nomini caption yoki fayl nomidan olamiz
+    title = ""
+    if message.caption:
+        lines = message.caption.split("\n")
+        title = lines[0].replace("🎬", "").replace("🍿", "").strip()[:60]
+    if not title and message.video.file_name:
+        title = message.video.file_name.rsplit(".", 1)[0][:60]
+    if not title:
+        title = f"{cat} #{code}"
+
+    caption = message.caption or f"🎬 {title}\n\n🔢 Kodi: {code}"
+    
+    await db.add_movie(
+        code=str(code),
+        title=title,
+        category=cat,
+        file_id=file_id,
+        caption=caption
+    )
+    await state.update_data(count=count)
+    await message.reply(f"✅ Saqlandi (#{count}) | Kodi: <code>{code}</code> | Nomi: <b>{title}</b>", parse_mode="HTML")
+
+@dp.message(BulkUploadState.collecting, Command("done"))
+async def bulk_done(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    count = data.get("count", 0)
+    cat = data.get("category", "")
+    await state.clear()
+    
+    await message.answer(
+        f"🎉 <b>Ommaviy ko'chirish yakunlandi!</b>\n\n"
+        f"📁 Bo'lim: <b>{cat}</b>\n"
+        f"📥 Jami saqlangan kinolar: <b>{count} ta</b>!\n\n"
+        f"Barcha kinolar botga tushdi va kodlari bilan birga foydalanishga tayyor.",
+        reply_markup=main_menu(),
+        parse_mode="HTML"
+    )
+    await send_auto_backup(f"Ommaviy import: {count} ta kino qo'shildi")
 
 # --- ADMINLARNI BOSHQARISH ---
 @dp.callback_query(F.data == "adm_manage_admins")
@@ -600,7 +698,7 @@ async def adm_stats_cb(call: types.CallbackQuery):
     await call.message.answer(text, parse_mode="HTML")
     await call.answer()
 
-# Kontent qo'shish
+# Yakka kino qo'shish
 @dp.callback_query(F.data == "adm_add_content")
 async def add_c_start(call: types.CallbackQuery, state: FSMContext):
     if not await check_is_admin(call.from_user.id):
@@ -799,7 +897,6 @@ async def handle_direct_code(message: types.Message):
         file_id, caption, title, views, category = movie
         await message.answer_video(video=file_id, caption=f"{caption}\n\n📁 #{category}\n👀 Ko'rishlar: {views}", supports_streaming=True)
     else:
-        # Agar kod topilmasa, internetdan qidirish tugmasini taklif qilamiz
         encoded = urllib.parse.quote(text)
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🌐 Internetdan izlash", callback_data=f"webfind_{encoded}")]
