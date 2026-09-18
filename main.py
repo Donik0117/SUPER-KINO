@@ -1,6 +1,7 @@
 import os
 import sys
 import asyncio
+import urllib.parse
 from dotenv import load_dotenv
 from aiohttp import web, ClientSession
 from aiogram import Bot, Dispatcher, F, types
@@ -26,7 +27,6 @@ import database as db
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# Bosh admin (Asosiy xo'jayin - uni hech kim o'chira olmaydi)
 raw_admin = os.getenv("ADMIN_ID", "7899678090").split(",")[0].strip()
 OWNER_ID = int(raw_admin) if raw_admin.isdigit() else 7899678090
 
@@ -45,6 +45,9 @@ class AddContentState(StatesGroup):
 class SearchState(StatesGroup):
     query = State()
 
+class WebSearchState(StatesGroup):
+    query = State()
+
 class DelContentState(StatesGroup):
     code = State()
 
@@ -60,7 +63,7 @@ class AddAdminState(StatesGroup):
     user_id = State()
     name = State()
 
-# --- Kafolatlangan Admin Baza Funksiyalari (database.py ga bog'liq bo'lmagan holda ishlaydi) ---
+# --- Kafolatlangan Admin Baza Funksiyalari ---
 async def ensure_admins_table():
     async with aiosqlite.connect("kino_master.db") as conn:
         await conn.execute("""
@@ -99,14 +102,32 @@ async def check_is_admin(user_id: int) -> bool:
             row = await cur.fetchone()
             return row is not None
 
+# --- Internetdan ma'lumot olish funksiyasi ---
+async def get_wikipedia_info(query: str):
+    url = f"https://ru.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(query)}"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    try:
+        async with ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=5) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    title = data.get("title", query)
+                    desc = data.get("extract", "")[:350]
+                    thumb = data.get("thumbnail", {}).get("source")
+                    return title, desc, thumb
+    except Exception:
+        pass
+    return query, "", None
+
 # --- Klaviaturalar ---
 def main_menu():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🎬 Kinolar"), KeyboardButton(text="⛩ Anime")],
             [KeyboardButton(text="📺 Seriallar"), KeyboardButton(text="🎭 Dramalar")],
-            [KeyboardButton(text="🔍 Qidirish"), KeyboardButton(text="🔝 Top 10")],
-            [KeyboardButton(text="🎲 Tasodifiy"), KeyboardButton(text="ℹ️ Bot haqida")]
+            [KeyboardButton(text="🔍 Qidirish"), KeyboardButton(text="🌐 Internetdan qidirish")],
+            [KeyboardButton(text="🔝 Top 10"), KeyboardButton(text="🎲 Tasodifiy")],
+            [KeyboardButton(text="ℹ️ Bot haqida")]
         ],
         resize_keyboard=True
     )
@@ -228,13 +249,13 @@ async def start_cmd(message: types.Message, command: CommandObject):
             share_kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="↗️ Do'stlarga ulashish", url=share_url)]
             ])
-            await message.answer_video(video=file_id, caption=f"{caption}\n\n📁 Kategoriya: #{category}\n👀 Ko'rishlar: {views}", reply_markup=share_kb)
+            await message.answer_video(video=file_id, caption=f"{caption}\n\n📁 Kategoriya: #{category}\n👀 Ko'rishlar: {views}", reply_markup=share_kb, supports_streaming=True)
             return
 
     await message.answer(
         f"👋 <b>Assalomu alaykum, {message.from_user.full_name}!</b>\n\n"
         "🍿 <b>Kino, Anime, Serial va Dramalar olamiga xush kelibsiz!</b>\n\n"
-        "Kerakli bo'limni tanlang yoki to'g'ridan-to'g'ri <b>kodni</b> yuboring:",
+        "Kerakli bo'limni tanlang, kodni yuboring yoki <b>🌐 Internetdan qidirish</b> tugmasidan foydalaning:",
         reply_markup=main_menu(),
         parse_mode="HTML"
     )
@@ -280,7 +301,7 @@ async def pagination_cb(call: types.CallbackQuery):
 async def noop_cb(call: types.CallbackQuery):
     await call.answer()
 
-# --- QIDIRUV ---
+# --- BAZA ICHIDAN QIDIRUV ---
 @dp.message(F.text == "🔍 Qidirish")
 async def search_cmd(message: types.Message, state: FSMContext):
     passed, _ = await is_subscribed(message.from_user.id)
@@ -289,7 +310,7 @@ async def search_cmd(message: types.Message, state: FSMContext):
         await message.answer("⚠️ <b>Avval kanallarga a'zo bo'ling:</b>", reply_markup=subscription_kb(chs), parse_mode="HTML")
         return
 
-    await message.answer("🔎 Qidirmoqchi bo'lgan kino, anime yoki serial <b>nomini</b> yoki <b>kodini</b> yozing:", parse_mode="HTML")
+    await message.answer("🔎 Bot bazasidan qidirmoqchi bo'lgan kino <b>nomini</b> yoki <b>kodini</b> yozing:", parse_mode="HTML")
     await state.set_state(SearchState.query)
 
 @dp.message(SearchState.query)
@@ -300,7 +321,7 @@ async def process_search_query(message: types.Message, state: FSMContext):
     movie = await db.get_movie_by_code(query)
     if movie:
         file_id, caption, title, views, category = movie
-        await message.answer_video(video=file_id, caption=f"{caption}\n\n📁 Kategoriya: #{category}\n👀 Ko'rishlar: {views}")
+        await message.answer_video(video=file_id, caption=f"{caption}\n\n📁 Kategoriya: #{category}\n👀 Ko'rishlar: {views}", supports_streaming=True)
         return
 
     results = await db.search_movies_by_title(query)
@@ -308,9 +329,83 @@ async def process_search_query(message: types.Message, state: FSMContext):
         buttons = []
         for code, title, cat in results:
             buttons.append([InlineKeyboardButton(text=f"▶️ [{cat}] {title} ({code})", callback_data=f"get_{code}")])
-        await message.answer(f"🔍 <b>'{query}'</b> bo'yicha topilgan natijalar:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+        await message.answer(f"🔍 <b>'{query}'</b> bo'yicha bot bazasidan topilgan natijalar:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
     else:
-        await message.answer("😔 Kechirasiz, bunday nom yoki kod bilan hech narsa topilmadi.")
+        # Agar bazada topilmasa, internetdan qidirishni taklif qilamiz
+        encoded = urllib.parse.quote(query)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🌐 Internetdan izlash", callback_data=f"webfind_{encoded}")]
+        ])
+        await message.answer(
+            f"😔 <b>'{query}'</b> boti bazasida topilmadi.\n"
+            "Lekin uni internetdagi online pleyerlar orqali topishingiz mumkin:",
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+
+# --- GLOBAL INTERNETDAN QIDIRISH ---
+@dp.message(F.text == "🌐 Internetdan qidirish")
+async def web_search_start(message: types.Message, state: FSMContext):
+    passed, _ = await is_subscribed(message.from_user.id)
+    if not passed:
+        chs = await db.get_channels()
+        await message.answer("⚠️ <b>Avval kanallarga a'zo bo'ling:</b>", reply_markup=subscription_kb(chs), parse_mode="HTML")
+        return
+
+    await message.answer(
+        "🌐 <b>Global Internet Qidiruvi:</b>\n\n"
+        "Qidirmoqchi bo'lgan kino, anime yoki serial <b>nomini</b> yozing (Masalan: <i>Avatar</i>, <i>Forsaj 10</i>, <i>Naruto</i>):",
+        parse_mode="HTML"
+    )
+    await state.set_state(WebSearchState.query)
+
+@dp.message(WebSearchState.query)
+async def web_search_process(message: types.Message, state: FSMContext):
+    await state.clear()
+    query = message.text.strip()
+    await send_web_results(message, query)
+
+@dp.callback_query(F.data.startswith("webfind_"))
+async def web_find_cb(call: types.CallbackQuery):
+    query = urllib.parse.unquote(call.data.replace("webfind_", ""))
+    await send_web_results(call.message, query)
+    await call.answer()
+
+async def send_web_results(target_msg: types.Message, query: str):
+    wait_msg = await target_msg.answer("🔎 <i>Internetdan qidirilmoqda, kuting...</i>", parse_mode="HTML")
+    
+    encoded = urllib.parse.quote(query)
+    title, desc, thumb = await get_wikipedia_info(query)
+    
+    caption = (
+        f"🌐 <b>Internetdan topilgan film:</b>\n\n"
+        f"🎬 Nomi: <b>{title}</b>\n"
+    )
+    if desc:
+        caption += f"📝 Syujet: <i>{desc}...</i>\n\n"
+    caption += "Quyidagi tugmalar orqali ushbu filmni <b>online tomosha qilishingiz</b> yoki <b>yuklab olishingiz</b> mumkin:"
+
+    buttons = [
+        [InlineKeyboardButton(text="🍿 1-Pleyer (Tezkor HD Pleyer)", url=f"https://kinobox.tv/?title={encoded}")],
+        [InlineKeyboardButton(text="🎬 2-Pleyer (O'zbekcha tarjima - Aslmedia)", url=f"https://aslmedia.net/index.php?do=search&subaction=search&story={encoded}")],
+        [InlineKeyboardButton(text="🎞 Rasmiy Treyler (YouTube)", url=f"https://www.youtube.com/results?search_query={encoded}+treyler")],
+        [InlineKeyboardButton(text="📥 Barcha yuklab olish manbalari", url=f"https://www.google.com/search?q={encoded}+kino+uzbek+tilida+yuklab+olish")]
+    ]
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    try:
+        await wait_msg.delete()
+    except Exception:
+        pass
+
+    if thumb:
+        try:
+            await target_msg.answer_photo(photo=thumb, caption=caption, reply_markup=kb, parse_mode="HTML")
+            return
+        except Exception:
+            pass
+
+    await target_msg.answer(caption, reply_markup=kb, parse_mode="HTML")
 
 # --- TOP 10 ---
 @dp.message(F.text == "🔝 Top 10")
@@ -347,7 +442,7 @@ async def random_movie_handler(message: types.Message):
     movie = await db.get_random_movie()
     if movie:
         file_id, caption, code, title, category = movie
-        await message.answer_video(video=file_id, caption=f"🎲 <b>Tasodifiy tanlov:</b> {title}\n\n{caption}\n\n🔢 Kodi: <code>{code}</code>\n📁 #{category}", parse_mode="HTML")
+        await message.answer_video(video=file_id, caption=f"🎲 <b>Tasodifiy tanlov:</b> {title}\n\n{caption}\n\n🔢 Kodi: <code>{code}</code>\n📁 #{category}", parse_mode="HTML", supports_streaming=True)
     else:
         await message.answer("Bazada hali filmlar mavjud emas.")
 
@@ -357,7 +452,7 @@ async def about_handler(message: types.Message):
     await message.answer(
         "🍿 <b>Kino, Anime & Serial Bot</b>\n\n"
         "⚡️ Barcha sevimli filmlar, animelar, seriallar va dramalarni bir joyda tomosha qiling!\n\n"
-        "🎯 Shunchaki qidiruvga nomini yozing yoki kodini kiriting!",
+        "🎯 Baza orqali kod bilan yoki <b>🌐 Internetdan qidirish</b> orqali istalgan filmni toping!",
         parse_mode="HTML"
     )
 
@@ -369,7 +464,7 @@ async def admin_cmd(message: types.Message):
     is_owner = (message.from_user.id == OWNER_ID)
     await message.answer("👑 <b>Admin Boshqaruv Markazi:</b>", reply_markup=admin_menu(is_owner=is_owner), parse_mode="HTML")
 
-# --- ADMINLARNI BOSHQARISH (100% KAFOLATLANGAN) ---
+# --- ADMINLARNI BOSHQARISH ---
 @dp.callback_query(F.data == "adm_manage_admins")
 async def manage_admins_cb(call: types.CallbackQuery):
     try:
@@ -413,7 +508,6 @@ async def del_admin_cb(call: types.CallbackQuery):
     await remove_admin_safe(target_uid)
     await call.answer("✅ Admin muvaffaqiyatli chetlashtirildi!", show_alert=True)
     
-    # Ro'yxatni yangilash
     admins = await get_all_admins_safe()
     buttons = []
     for uid, name in admins:
@@ -687,7 +781,7 @@ async def get_inline_movie(call: types.CallbackQuery):
     movie = await db.get_movie_by_code(code)
     if movie:
         file_id, caption, title, views, category = movie
-        await call.message.answer_video(video=file_id, caption=f"{caption}\n\n📁 #{category}\n👀 Ko'rishlar: {views}")
+        await call.message.answer_video(video=file_id, caption=f"{caption}\n\n📁 #{category}\n👀 Ko'rishlar: {views}", supports_streaming=True)
     await call.answer()
 
 # Oddiy xabarlar (kod yozilganda)
@@ -703,9 +797,14 @@ async def handle_direct_code(message: types.Message):
     movie = await db.get_movie_by_code(text)
     if movie:
         file_id, caption, title, views, category = movie
-        await message.answer_video(video=file_id, caption=f"{caption}\n\n📁 #{category}\n👀 Ko'rishlar: {views}")
+        await message.answer_video(video=file_id, caption=f"{caption}\n\n📁 #{category}\n👀 Ko'rishlar: {views}", supports_streaming=True)
     else:
-        await message.answer("😔 Kechirasiz, bunday kod topilmadi. Qidirish uchun '🔍 Qidirish' tugmasidan foydalaning.")
+        # Agar kod topilmasa, internetdan qidirish tugmasini taklif qilamiz
+        encoded = urllib.parse.quote(text)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🌐 Internetdan izlash", callback_data=f"webfind_{encoded}")]
+        ])
+        await message.answer("😔 Kechirasiz, bot bazasidan bunday kod topilmadi.\nInternet orqali qidirib ko'rasizmi?", reply_markup=kb)
 
 # --- 24/7 KEEP-ALIVE VA KUNLIK AVTO-ZAXIRA ---
 async def health_check(request):
