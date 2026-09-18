@@ -24,7 +24,10 @@ import database as db
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
+
+# Bosh admin (Asosiy xo'jayin - uni hech kim o'chira olmaydi)
+raw_admin = os.getenv("ADMIN_ID", "7899678090").split(",")[0].strip()
+OWNER_ID = int(raw_admin) if raw_admin.isdigit() else 7899678090
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -52,6 +55,17 @@ class AddChannelState(StatesGroup):
 class BroadcastState(StatesGroup):
     message = State()
 
+class AddAdminState(StatesGroup):
+    user_id = State()
+    name = State()
+
+# --- Adminlikni tekshirish ---
+async def check_is_admin(user_id: int) -> bool:
+    if user_id == OWNER_ID:
+        return True
+    admin_ids = await db.get_admin_ids()
+    return user_id in admin_ids
+
 # --- Klaviaturalar ---
 def main_menu():
     return ReplyKeyboardMarkup(
@@ -64,15 +78,18 @@ def main_menu():
         resize_keyboard=True
     )
 
-def admin_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
+def admin_menu(is_owner: bool = False):
+    buttons = [
         [InlineKeyboardButton(text="➕ Yangi kontent qo'shish", callback_data="adm_add_content")],
         [InlineKeyboardButton(text="🗑 Kontentni o'chirish", callback_data="adm_del_content")],
-        [InlineKeyboardButton(text="📢 Kanallarni boshqarish (OP)", callback_data="adm_channels")],
-        [InlineKeyboardButton(text="✉️ Xabar tarqatish (Rassilka)", callback_data="adm_broadcast")],
-        [InlineKeyboardButton(text="📊 Statistika", callback_data="adm_stats")],
-        [InlineKeyboardButton(text="💾 Baza yuklab olish", callback_data="adm_backup")]
-    ])
+        [InlineKeyboardButton(text="📊 Statistika", callback_data="adm_stats")]
+    ]
+    if is_owner:
+        buttons.append([InlineKeyboardButton(text="👥 Adminlarni boshqarish", callback_data="adm_manage_admins")])
+        buttons.append([InlineKeyboardButton(text="📢 Kanallarni boshqarish (OP)", callback_data="adm_channels")])
+        buttons.append([InlineKeyboardButton(text="✉️ Xabar tarqatish (Rassilka)", callback_data="adm_broadcast")])
+        buttons.append([InlineKeyboardButton(text="💾 Baza yuklab olish", callback_data="adm_backup")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def category_choose_kb():
     buttons = []
@@ -115,7 +132,6 @@ def subscription_kb(channels):
     buttons.append([InlineKeyboardButton(text="✅ A'zo bo'ldim / Tekshirish", callback_data="check_subscription")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-# Kanal ID yoki Username ni to'g'rilash funksiyasi
 def normalize_chat_id(ch_str: str):
     ch_str = str(ch_str).strip()
     if "t.me/" in ch_str:
@@ -128,7 +144,6 @@ def normalize_chat_id(ch_str: str):
         return int(ch_str)
     return ch_str
 
-# --- Obuna tekshirish (Mukammal versiya) ---
 async def is_subscribed(user_id: int):
     channels = await db.get_channels()
     if not channels:
@@ -143,17 +158,16 @@ async def is_subscribed(user_id: int):
                 unsub.append(ch)
         except Exception as err:
             print(f"[OBUNA TEKSHIRISH XATOSI] Kanal: {ch_target}, Xato: {err}")
-            # Agar bot kanalga admin bo'lmasa yoki kanal xato kiritilgan bo'lsa:
             unsub.append(ch)
             
     return len(unsub) == 0, unsub
 
 async def send_auto_backup(extra_info=""):
     try:
-        if os.path.exists("kino_master.db") and ADMIN_ID:
+        if os.path.exists("kino_master.db") and OWNER_ID:
             file = FSInputFile("kino_master.db")
             caption = f"💾 <b>Avtomatik Zaxira (Backup)</b>\n{extra_info}\nServer o'chsa ham ushbu faylni botga yuborib qayta tiklashingiz mumkin!"
-            await bot.send_document(chat_id=ADMIN_ID, document=file, caption=caption, parse_mode="HTML")
+            await bot.send_document(chat_id=OWNER_ID, document=file, caption=caption, parse_mode="HTML")
     except Exception:
         pass
 
@@ -317,15 +331,92 @@ async def about_handler(message: types.Message):
 # --- ADMIN PANEL ---
 @dp.message(Command("admin"))
 async def admin_cmd(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
+    if not await check_is_admin(message.from_user.id):
         return
-    await message.answer("👑 <b>Admin Boshqaruv Markazi:</b>", reply_markup=admin_menu(), parse_mode="HTML")
+    is_owner = (message.from_user.id == OWNER_ID)
+    await message.answer("👑 <b>Admin Boshqaruv Markazi:</b>", reply_markup=admin_menu(is_owner=is_owner), parse_mode="HTML")
+
+# --- ADMINLARNI BOSHQARISH (FAQAT BOSH ADMIN UCHUN) ---
+@dp.callback_query(F.data == "adm_manage_admins")
+async def manage_admins_cb(call: types.CallbackQuery):
+    if call.from_user.id != OWNER_ID:
+        await call.answer("Bu bo'lim faqat Bosh Admin uchun!", show_alert=True)
+        return
+    
+    admins = await db.get_all_admins()
+    buttons = []
+    for uid, name in admins:
+        display_name = name or f"Admin {uid}"
+        buttons.append([InlineKeyboardButton(text=f"❌ Chetlashtirish: {display_name}", callback_data=f"deladmin_{uid}")])
+    
+    buttons.append([InlineKeyboardButton(text="➕ Yangi Admin tayinlash", callback_data="add_admin_start")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="adm_back_to_menu")])
+
+    await call.message.answer(
+        "👥 <b>Yordamchi Adminlar Boshqaruvi:</b>\n\n"
+        "Siz istalgan paytda yordamchi admin qo'shishingiz yoki uning vakolatini bir zumda bekor qilishingiz (chetlashtirishingiz) mumkin.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+@dp.callback_query(F.data == "adm_back_to_menu")
+async def back_to_admin_menu(call: types.CallbackQuery):
+    is_owner = (call.from_user.id == OWNER_ID)
+    await call.message.answer("👑 <b>Admin Boshqaruv Markazi:</b>", reply_markup=admin_menu(is_owner=is_owner), parse_mode="HTML")
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("deladmin_"))
+async def del_admin_cb(call: types.CallbackQuery):
+    if call.from_user.id != OWNER_ID:
+        await call.answer("Ruxsat berilmagan!", show_alert=True)
+        return
+    
+    target_uid = int(call.data.replace("deladmin_", ""))
+    await db.remove_admin(target_uid)
+    await call.message.answer(f"✅ <b>Admin (ID: {target_uid}) muvaffaqiyatli chetlashtirildi!</b>\nEndi u botda adminlik qila olmaydi.", parse_mode="HTML")
+    await call.answer()
+
+@dp.callback_query(F.data == "add_admin_start")
+async def add_admin_start_cb(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != OWNER_ID:
+        await call.answer("Ruxsat berilmagan!", show_alert=True)
+        return
+    await call.message.answer("👤 Tayinlamoqchi bo'lgan shaxsning <b>Telegram ID raqamini</b> kiriting (masalan: <code>6902272738</code>):", parse_mode="HTML")
+    await state.set_state(AddAdminState.user_id)
+    await call.answer()
+
+@dp.message(AddAdminState.user_id)
+async def process_add_admin_id(message: types.Message, state: FSMContext):
+    val = message.text.strip()
+    if not val.isdigit():
+        await message.answer("❌ ID faqat raqamlardan iborat bo'lishi kerak. Qaytadan kiriting:")
+        return
+    await state.update_data(user_id=int(val))
+    await message.answer("📝 Ushbu admin uchun <b>nom yoki laqab</b> yozing (Masalan: <i>Operator Alisher</i>):", parse_mode="HTML")
+    await state.set_state(AddAdminState.name)
+
+@dp.message(AddAdminState.name)
+async def process_add_admin_name(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    uid = data['user_id']
+    name = message.text.strip()
+    
+    await db.add_admin(user_id=uid, name=name)
+    await message.answer(
+        f"🎉 <b>Yangi admin tayinlandi!</b>\n\n"
+        f"👤 Nom: <b>{name}</b>\n"
+        f"🆔 ID: <code>{uid}</code>\n\n"
+        f"Ushbu shaxs endi botga /admin deb yozib yangi kinolar qo'shishi mumkin. Kerak bo'lsa uni istalgan payt '👥 Adminlarni boshqarish' bo'limidan chetlashtira olasiz.",
+        parse_mode="HTML"
+    )
+    await state.clear()
 
 @dp.message(Command("backup"))
 @dp.callback_query(F.data == "adm_backup")
 async def adm_backup_cb(event: types.Message | types.CallbackQuery):
     msg = event if isinstance(event, types.Message) else event.message
-    if msg.chat.id != ADMIN_ID:
+    if msg.chat.id != OWNER_ID:
         return
     if os.path.exists("kino_master.db"):
         await msg.answer_document(
@@ -335,8 +426,10 @@ async def adm_backup_cb(event: types.Message | types.CallbackQuery):
     if isinstance(event, types.CallbackQuery):
         await event.answer()
 
-@dp.message(F.document, F.chat.id == ADMIN_ID)
+@dp.message(F.document)
 async def restore_database(message: types.Message):
+    if message.chat.id != OWNER_ID:
+        return
     if message.document.file_name and message.document.file_name.endswith(".db"):
         file_id = message.document.file_id
         file = await bot.get_file(file_id)
@@ -346,6 +439,9 @@ async def restore_database(message: types.Message):
 
 @dp.callback_query(F.data == "adm_stats")
 async def adm_stats_cb(call: types.CallbackQuery):
+    if not await check_is_admin(call.from_user.id):
+        await call.answer("Ruxsat yo'q!", show_alert=True)
+        return
     users, movies, views, cat_stats = await db.get_statistics()
     text = (
         f"📊 <b>Bot Statistikasi:</b>\n\n"
@@ -362,6 +458,9 @@ async def adm_stats_cb(call: types.CallbackQuery):
 # Kontent qo'shish
 @dp.callback_query(F.data == "adm_add_content")
 async def add_c_start(call: types.CallbackQuery, state: FSMContext):
+    if not await check_is_admin(call.from_user.id):
+        await call.answer("Ruxsat yo'q!", show_alert=True)
+        return
     await call.message.answer("📝 Yangi kontent uchun <b>kod</b> kiriting (masalan: <code>101</code>):", parse_mode="HTML")
     await state.set_state(AddContentState.code)
     await call.answer()
@@ -415,6 +514,9 @@ async def add_c_video(message: types.Message, state: FSMContext):
 # Kontent o'chirish
 @dp.callback_query(F.data == "adm_del_content")
 async def del_c_start(call: types.CallbackQuery, state: FSMContext):
+    if not await check_is_admin(call.from_user.id):
+        await call.answer("Ruxsat yo'q!", show_alert=True)
+        return
     await call.message.answer("🗑 O'chirmoqchi bo'lgan kontent <b>kodini</b> yozing:", parse_mode="HTML")
     await state.set_state(DelContentState.code)
     await call.answer()
@@ -425,9 +527,12 @@ async def del_c_finish(message: types.Message, state: FSMContext):
     await message.answer("✅ Muvaffaqiyatli o'chirildi.")
     await state.clear()
 
-# Kanallar (Aqlli tekshiruv bilan)
+# Kanallar
 @dp.callback_query(F.data == "adm_channels")
 async def ch_list_cb(call: types.CallbackQuery):
+    if call.from_user.id != OWNER_ID:
+        await call.answer("Bu amal faqat Bosh Admin uchun!", show_alert=True)
+        return
     chs = await db.get_channels()
     kb = []
     for c in chs:
@@ -458,7 +563,6 @@ async def add_ch_id(message: types.Message, state: FSMContext):
     raw_val = message.text.strip()
     target_id = normalize_chat_id(raw_val)
     
-    # Bot haqiqatan ham shu kanalda adminligini tekshirib ko'ramiz
     try:
         me = await bot.get_me()
         chat_member = await bot.get_chat_member(chat_id=target_id, user_id=me.id)
@@ -489,6 +593,9 @@ async def add_ch_finish(message: types.Message, state: FSMContext):
 # Rassilka
 @dp.callback_query(F.data == "adm_broadcast")
 async def broad_start(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != OWNER_ID:
+        await call.answer("Rassilka faqat Bosh Admin uchun!", show_alert=True)
+        return
     await call.message.answer("📢 Tarqatmoqchi bo'lgan xabaringizni yuboring:")
     await state.set_state(BroadcastState.message)
     await call.answer()
